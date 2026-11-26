@@ -36,7 +36,7 @@ N → N/4 → N/16 → ⋯
 
 The stages use twiddle factors
 
-\[ W_N\^k = e\^{-j2`\pi `{=tex}k/N}. \]
+$\[ W_N\^k = e\^{-j2`\pi `{=tex}k/N}. \]$
 
 The implementation stores the first half of the twiddle table (`N/2`
 complex values). It uses conjugate symmetry where required, and reuses
