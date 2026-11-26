@@ -32,10 +32,7 @@ A radix-4 butterfly combines four input values and produces four output
 values. At each radix-4 stage, the transform length is reduced by a
 factor of four:
 
-$$
-\[ N `\rightarrow `{=tex}N/4 `\rightarrow `{=tex}N/16
-`\rightarrow `{=tex}`\cdots`{=tex} \]
-$$
+N → N/4 → N/16 → ⋯
 
 The stages use twiddle factors
 
