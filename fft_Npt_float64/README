@@ -1,0 +1,136 @@
+FFT Verification Flow (radix-4)
+================================
+
+
+Please Run the commands in order:-
+
+1.) python3 input_result_generator.py
+2.) python3 generate_mcode.py              -> writes fft_N.mcode  (e.g. fft_64.mcode)
+3.) ./run.sh fft_N                         (e.g. ./run.sh fft_64)
+4.) python3 accuracy_out.py
+
+Supported sizes: N = 16, 32, 64, ..., 2048 (powers of 2).  The simulator's data
+memory holds 8192 64-bit words and the FFT needs 3N of them.
+
+Alternative:-
+Run this command:  ./run_fft_verification.sh	//this shell script runs all the commands in order
+
+=====================
+Explanation Below
+=====================
+
+1. Generate FFT Inputs and Golden Outputs
+
+    python3 input_result_generator.py
+
+This script generates:
+
+    data.map    - Input samples and twiddle factors in float64 hex format.
+    input.txt   - Input samples and twiddle factors in decimal format.
+    result.txt  - Golden FFT outputs in float64 hex format (bit-reversed order).
+    output.txt  - Golden FFT outputs in decimal format (bit-reversed order).
+
+Input samples are randomly generated float64 values in the range:
+
+    [-1000000.0, +1000000.0]
+
+data.map format (one 64-bit float64 value = 16 hex digits per entry):
+
+    0      : x[0].real
+    1      : x[0].imag
+    ...
+    2N-1   : x[N-1].imag            inputs   : 2N entries (2N x 16 hex digits)
+
+    2N     : W[0].real
+    2N + 1 : W[0].imag
+    ...
+    3N - 1 : W[N/2 - 1].imag        twiddles : N entries (N/2 complex W_N^k, k < N/2)
+
+Total entries in data.map: 3N   (3N * 8 bytes)
+
+The FFT runs in place: it reads and writes only these 3N entries.  Only the
+N/2 twiddles W_N^k (k < N/2) are stored; the radix-4 code obtains every other
+twiddle it needs from them by symmetry (W^3k = conj(W[N-3k]) for 3k > N/2) and
+re-uses the twiddle area for the smaller per-stage tables.
+
+
+2. Generate FFT mcode
+
+    python3 generate_mcode.py          (prompts for N)
+    python3 generate_mcode.py 256      (or pass N on the command line)
+
+This script reads the reference file fftN_new.mcode and
+writes a new file
+
+    fft_N.mcode          e.g. fft_64.mcode, fft_256.mcode, fft_1024.mcode
+
+every time it is executed.
+
+fftN_new.mcode is the radix-4 reference.  It is a complete, runnable N=64
+program followed by a library of blocks needed by other sizes.  Each block is
+delimited by "//@BLOCK name ... //@END" and every N-dependent immediate carries
+a "//@ formula" annotation.  The generator selects/orders/repeats the blocks for
+the requested N and evaluates the formulas; the instruction schedule itself is
+taken unchanged from the reference.  See the header of fftN_new.mcode for the
+algorithm and register map.
+
+
+3. Run FFT Assembly Program
+
+    ./run.sh fft_N
+
+This assembles and runs the FFT implementation.
+
+The program reads inputs from data.map, performs the FFT computation,
+and compares the generated outputs against the golden outputs in
+result.txt.
+
+A log file named run.log is generated containing the comparison results.
+
+
+4. Generate Accuracy Report
+
+    python3 accuracy_out.py
+
+This script parses run.log and generates:
+
+    accuracy_report.txt
+
+It also prints a summary on the terminal showing:
+
+    - Max Relative Error (%)
+    - Average Relative Error (%)
+    - Max Absolute Error
+    - Average Absolute Error
+    - RMS Error
+    - Data Memory used (2N input entries, N twiddle entries)
+    - Bundles executed(Ticks), instructions per bundle(IPB) and efficiency
+
+[IPB = non-null instructions / bundles executed; the machine maximum is 8]
+
+accuracy_report.txt contains detailed per-sample accuracy information.
+Results differ from numpy only in the last bits (rounding); the report shows
+the size of these differences.
+
+
+=====================
+Implementation
+=====================
+
+In-place decimation-in-frequency radix-4 FFT (output in bit-reversed order,
+same as before).  For odd log2(N) the last radix-4 stage (L=8) is fused with
+the final radix-2 stage.
+
+    stage 0 (L = N)     radix-4 butterfly pairs; W^k, W^2k, W^3k from the
+                        N/2-entry table (W^3k by conjugate symmetry when 3k > N/2)
+    stages L = N/4 ...  generic radix-4 stages, twiddles from a compacted table
+    L = 16 / L = 8      constant twiddles folded into the butterflies
+    L = 4               trivial butterflies
+
+Every loop is software pipelined: one iteration of the main butterfly loop
+processes two radix-4 butterflies (k, k+1) with 256-bit loads/stores in
+11 bundles (81 instructions + branch).
+
+
+==================================================================
+Note: for a new run do ./clean.sh before following the aforementioned steps.

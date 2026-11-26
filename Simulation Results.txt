@@ -1,0 +1,107 @@
+Simulation Results:-
+
+For N-point FFT
+-------------------------------------------------------------
+N = 16
+
+Execution:
+  bundles executed (ticks)      : 29
+  non-null instructions         : 213
+  null instructions             : 19
+  instructions per bundle (IPB) : 7.345  (max 8)
+
+  efficiency (IPB / 8)             : 91.810%
+
+
+-------------------------------------------------------------
+
+N = 32
+
+Execution:
+  bundles executed (ticks)      : 83
+  non-null instructions         : 621
+  null instructions             : 43
+  instructions per bundle (IPB) : 7.482  (max 8)
+
+  efficiency (IPB / 8)             : 93.524%
+
+
+-------------------------------------------------------------
+
+N = 64
+
+Execution:
+  bundles executed (ticks)      : 202
+  non-null instructions         : 1521
+  null instructions             : 95
+  instructions per bundle (IPB) : 7.530  (max 8)
+
+  efficiency (IPB / 8)             : 94.121%
+
+
+-------------------------------------------------------------
+
+N = 128
+
+Execution:
+  bundles executed (ticks)      : 501
+  non-null instructions         : 3778
+  null instructions             : 230
+  instructions per bundle (IPB) : 7.541  (max 8)
+
+  efficiency (IPB / 8)             : 94.261%
+
+
+-------------------------------------------------------------
+
+N = 256
+
+Execution:
+  bundles executed (ticks)      : 1154
+  non-null instructions         : 8709
+  null instructions             : 523
+  instructions per bundle (IPB) : 7.547  (max 8)
+
+  efficiency (IPB / 8)             : 94.335%
+
+
+-------------------------------------------------------------
+
+N = 512
+
+Execution:
+  bundles executed (ticks)      : 2698
+  non-null instructions         : 20281
+  null instructions             : 1303
+  instructions per bundle (IPB) : 7.517  (max 8)
+
+  efficiency (IPB / 8)             : 93.963%
+
+
+-------------------------------------------------------------
+
+N = 1024
+
+Execution:
+  bundles executed (ticks)      : 6023
+  non-null instructions         : 45289
+  null instructions             : 2895
+  instructions per bundle (IPB) : 7.519  (max 8)
+
+  efficiency (IPB / 8)             : 93.992%
+
+
+-------------------------------------------------------------
+
+N = 2048
+
+Execution:
+  bundles executed (ticks)      : 13583
+  non-null instructions         : 101959
+  null instructions             : 6705
+  instructions per bundle (IPB) : 7.506  (max 8)
+
+  efficiency (IPB / 8)             : 93.830%
+
+
+-------------------------------------------------------------

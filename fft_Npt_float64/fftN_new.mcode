@@ -1,0 +1,2125 @@
+//=============================================================================
+//  fftN_new.mcode  --  radix-4 FFT reference / template          (as written: N = 64)
+//=============================================================================
+//  This file is a complete, runnable N-point radix-4 FFT program for N = 64.
+//  It is used to generate new mcode files for other FFTs any value of N
+//
+//  Template conventions
+//    //@BLOCK <name> ... //@END   a block of bundles; the generator selects,
+//                                 repeats (one copy per stage) and orders blocks
+//    <instr>   //@ <expr>         N-dependent immediate: the last integer of the
+//                                 instruction is replaced by <expr> evaluated for N
+//    Blocks after the $halt of the N=64 program form a library used by other N.
+//
+//  Memory (64-bit words, unchanged layout, nothing else is touched)
+//    words 0 .. 2N-1   x[n] = (re, im)             -> 2N entries  (inputs)
+//    words 2N .. 3N-1  W_N^k = (cos, -sin), k<N/2   -> N entries   (twiddles)
+//    Output: X[k] in bit-reversed order, in place over x.
+//    The twiddle area is re-used in place for the per-stage twiddle tables.
+//
+//  Algorithm: in-place decimation-in-frequency radix-4.  A butterfly writes
+//    q0 <- Y0, q1 <- Y2*W^2k, q2 <- Y1*W^k, q3 <- Y3*W^3k   (middle outputs swapped),
+//  so the result is in plain binary bit-reversed order.  log2(N) odd: the last
+//  radix-4 stage (L=8) is fused with the final radix-2 stage.
+//    stage 0 (L=N)   : W^k, W^2k from the half table; W^3k = W[3k] (3k<N/2) or
+//                      conj(W[N-3k]) (3k>N/2).  As the table entries are consumed,
+//                      T1[m] = W_N^{4m} is written over them (m < N/8).
+//    neg             : T1[N/8+m] = -T1[m]   -> T1 = W_{N/4}^m, m < 3N/16
+//    stage L>=32     : generic radix-4 stage, table T = W_L^m, m < 3L/4
+//    cmp             : T[m] = T[4m]  (table for the next stage)
+//    L=16 / L=8      : constant twiddles (W16^2 = c(1-j), W16^4 = -j, ...) folded
+//    L=4             : trivial butterflies
+//
+//  Scheduling: every loop is software pipelined (modulo scheduled); one
+//  iteration of the butterfly loops processes a PAIR of butterflies (k, k+1)
+//  with 256-bit loads/stores, in 11 bundles (82 instructions incl. branch).
+//  Post-increment addressing  [rA + rB ++k]  (rB += k * access size) advances
+//  pointers for free.
+//
+//  Registers (byte addresses; 256-bit loads need a register number divisible by 4)
+//    all blocks  r0 = 0 (never written)
+//    s0_*, gen_* r1 load ptr, r2 store ptr, r3/r24/r25 quarter offsets 16Q/32Q/48Q,
+//                r4-r7 x[k],x[k+1]   r8-r11 x[k+Q..]   r12-r15 x[k+2Q..]   r16-r19 x[k+3Q..]
+//                r20-r23 twiddle buffer, r26/r27/r28 pointers to W^k, W^2k, W^3k,
+//                r29 pair counter, r30 group counter (stage 0: W^3k address of the
+//                straddling pair), r31 stage 0: write pointer of the next twiddle table
+//    l16/l8/r4/neg/cmp  r1 load ptr, r2 store ptr, r3 loop counter; l16 and l8 also
+//                r24/r25 = (c, -c) = W16^2 resp. W8^1 and r26 = twiddle table base;
+//                all other registers hold data
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+//  N = 64 program: stage 0 (L=64) -> L=16 -> L=4
+//-----------------------------------------------------------------------------
+//@BLOCK s0_pro
+// stage 0 (L=N): setup + prologue
+s0_pro:
+  ||
+  $set $r1 0 0                                        //@ 0
+  $set $r24 0 512                                     //@ 8*N
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+s0_pro_b1:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  $set $r3 0 256                                      //@ 4*N
+  $set $r25 0 768                                     //@ 12*N
+  $set $r29 0 4                                       //@ S0_LOOPA-1
+  $set $r31 0 1024                                    //@ T
+  $set $r30 0 1520                                    //@ S0_COUT
+  $null
+;
+s0_pro_b2:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $set $r27 0 1024                                    //@ T
+  $set $r28 0 1024                                    //@ T
+;
+s0_pro_b3:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  $set $r2 0 0                                        //@ 0
+  $set $r26 0 1024                                    //@ T
+;
+//@END
+//@BLOCK s0_A
+// stage 0: butterfly pairs with 3k < N/2 (W3 = W[3k]); runs S0_LOOPA times
+//   (loop block: executes S0_LOOPA times; removed by the generator when that is 0)
+s0_A:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++6]
+  $ld ($u128) $r20 [$r28 + 48]
+;
+s0_A_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+s0_A_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+s0_A_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  - $r16 ($f64) $r16 $r17
+  + $r17 ($f64) $r23 $r22
+  - $r18 ($f64) $r18 $r19
+  + $r19 ($f64) $r21 $r20
+  $null
+;
+s0_A_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+s0_A_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+s0_A_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+s0_A_b7:
+  ||
+  $st ($u128) [$r0 + $r31 ++1] $r20
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  $null
+;
+s0_A_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  $null
+  $null
+;
+s0_A_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+s0_A_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  ? ($i16) $r29 >--1 $goto s0_A
+  $null
+;
+//@END
+//@BLOCK s0_TX
+// stage 0: transition pair straddling 3k = N/2 (k: W[3k], k+1: conj W[N-3k-3])
+s0_TX:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++6]
+  $ld ($u128) $r20 [$r0 + $r30]
+;
+s0_TX_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+s0_TX_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+s0_TX_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  - $r16 ($f64) $r16 $r17
+  + $r17 ($f64) $r23 $r22
+  + $r18 ($f64) $r18 $r19
+  - $r19 ($f64) $r20 $r21
+  $set $r29 0 1                                       //@ S0_NB-1
+;
+s0_TX_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+s0_TX_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+s0_TX_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+s0_TX_b7:
+  ||
+  $st ($u128) [$r0 + $r31 ++1] $r20
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  $null
+;
+s0_TX_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  + $r28 ($i64) $r30 -48
+  $null
+;
+s0_TX_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+s0_TX_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  $null
+  $null
+;
+//@END
+//@BLOCK s0_B
+// stage 0: butterfly pairs with 3k > N/2 (W3 = conj W[N-3k]); runs S0_NB times
+//   (loop block: executes S0_NB times; removed by the generator when that is 0)
+s0_B:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++26]
+  $ld ($u128) $r20 [$r28 + -48]
+;
+s0_B_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+s0_B_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+s0_B_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  + $r16 ($f64) $r16 $r17
+  - $r17 ($f64) $r22 $r23
+  + $r18 ($f64) $r18 $r19
+  - $r19 ($f64) $r20 $r21
+  $null
+;
+s0_B_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+s0_B_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+s0_B_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+s0_B_b7:
+  ||
+  $st ($u128) [$r0 + $r31 ++1] $r20
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  $null
+;
+s0_B_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  $null
+  $null
+;
+s0_B_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+s0_B_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  ? ($i16) $r29 >--1 $goto s0_B
+  $null
+;
+//@END
+//@BLOCK l16_pro
+// radix-4 stage L=16 (constant twiddles): setup + prologue
+l16_pro:
+  ||
+  $set $r1 0 0                                        //@ 0
+  $set $r26 0 1024                                    //@ T
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+l16_pro_b1:
+  ||
+  $ld ($u256) $r20 [$r0 + $r1 ++8]
+  $ld ($u256) $r4 [$r1 + 128]
+  $set $r2 0 0                                        //@ 0
+  $set $r3 0 2                                        //@ L16_IT-2
+  $ld ($u128) $r24 [$r26 + 32]                        //@ 32*S16
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK l16_loop
+// radix-4 stage L=16 (constant twiddles): loop body
+//   (loop block: executes L16_IT-1 times; removed by the generator when that is 0)
+l16_loop:
+  ||
+  $ld ($u256) $r28 [$r1 + -192]
+  $ld ($u256) $r12 [$r1 + -64]
+  $ld ($u256) $r16 [$r1 + -224]
+  $ld ($u256) $r8 [$r1 + -96]
+  + $r20 ($f64) $r20 $r4
+  - $r4 ($f64) $r20 $r4
+  + $r23 ($f64) $r23 $r7
+  - $r7 ($f64) $r23 $r7
+;
+l16_loop_b1:
+  ||
+  + $r22 ($f64) $r22 $r6
+  - $r6 ($f64) $r22 $r6
+  + $r30 ($f64) $r30 $r14
+  - $r14 ($f64) $r30 $r14
+  + $r31 ($f64) $r31 $r15
+  - $r15 ($f64) $r31 $r15
+  + $r19 ($f64) $r19 $r11
+  - $r11 ($f64) $r19 $r11
+;
+l16_loop_b2:
+  ||
+  + $r28 ($f64) $r28 $r12
+  - $r12 ($f64) $r28 $r12
+  + $r18 ($f64) $r18 $r10
+  - $r10 ($f64) $r18 $r10
+  + $r22 ($f64) $r22 $r30
+  - $r30 ($f64) $r22 $r30
+  + $r23 ($f64) $r23 $r31
+  - $r31 ($f64) $r23 $r31
+;
+l16_loop_b3:
+  ||
+  + $r21 ($f64) $r21 $r5
+  - $r5 ($f64) $r21 $r5
+  + $r29 ($f64) $r29 $r13
+  - $r13 ($f64) $r29 $r13
+  + $r20 ($f64) $r20 $r28
+  - $r28 ($f64) $r20 $r28
+  + $r30 ($f64) $r30 $r31
+  - $r31 ($f64) $r31 $r30
+;
+l16_loop_b4:
+  ||
+  + $r21 ($f64) $r21 $r29
+  - $r29 ($f64) $r21 $r29
+  + $r6 ($f64) $r6 $r15
+  - $r7 ($f64) $r7 $r14
+  - $r14 ($f64) $r6 $r15
+  + $r15 ($f64) $r7 $r14
+  * $r30 ($f64) $r30 $r24
+  * $r31 ($f64) $r31 $r24
+;
+l16_loop_b5:
+  ||
+  $ld ($u256) $r28 [$r1 + -160]
+  $ld ($u256) $r20 [$r1 + -32]
+  + $r16 ($f64) $r16 $r8
+  - $r8 ($f64) $r16 $r8
+  + $r17 ($f64) $r17 $r9
+  - $r9 ($f64) $r17 $r9
+  $st ($u256) [$r0 + $r2 ++8] $r20
+  $st ($u256) [$r2 + 64] $r28
+;
+l16_loop_b6:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r30 ($f64) $r30 $r22
+  - $r22 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r23 ($f64) $r31 $r23
+;
+l16_loop_b7:
+  ||
+  + $r16 ($f64) $r16 $r28
+  + $r17 ($f64) $r17 $r29
+  - $r28 ($f64) $r17 $r29
+  - $r29 ($f64) $r28 $r16
+  + $r18 ($f64) $r18 $r30
+  - $r30 ($f64) $r18 $r30
+  + $r19 ($f64) $r19 $r31
+  - $r31 ($f64) $r19 $r31
+;
+l16_loop_b8:
+  ||
+  + $r8 ($f64) $r8 $r21
+  - $r9 ($f64) $r9 $r20
+  - $r20 ($f64) $r8 $r21
+  + $r21 ($f64) $r9 $r20
+  $ld ($u128) $r16 [$r26 + 16]                        //@ 16*S16
+  - $r30 ($f64) $r31 $r30
+  + $r31 ($f64) $r30 $r31
+  $st ($u256) [$r2 + -224] $r16
+;
+l16_loop_b9:
+  ||
+  + $r10 ($f64) $r10 $r23
+  - $r11 ($f64) $r11 $r22
+  - $r22 ($f64) $r23 $r10
+  + $r23 ($f64) $r11 $r22
+  - $r20 ($f64) $r21 $r20
+  + $r21 ($f64) $r20 $r21
+  * $r30 ($f64) $r30 $r24
+  * $r31 ($f64) $r31 $r25
+;
+l16_loop_b10:
+  ||
+  + $r4 ($f64) $r4 $r13
+  - $r5 ($f64) $r5 $r12
+  - $r12 ($f64) $r4 $r13
+  + $r13 ($f64) $r5 $r12
+  $ld ($u128) $r28 [$r26 + 48]                        //@ 48*S16
+  + $r8 ($f64) $r8 $r9
+  - $r9 ($f64) $r9 $r8
+  $st ($u256) [$r2 + -160] $r28
+;
+l16_loop_b11:
+  ||
+  $ld ($u128) $r30 [$r26 + 16]                        //@ 16*S16
+  $ld ($u128) $r18 [$r26 + 48]                        //@ 48*S16
+  * $r14 ($f64) $r14 $r28
+  * $r15 ($f64) $r15 $r29
+  * $r29 ($f64) $r14 $r29
+  * $r28 ($f64) $r15 $r28
+  * $r8 ($f64) $r8 $r24
+  * $r9 ($f64) $r9 $r24
+;
+l16_loop_b12:
+  ||
+  * $r6 ($f64) $r6 $r30
+  * $r7 ($f64) $r7 $r31
+  * $r31 ($f64) $r6 $r31
+  * $r30 ($f64) $r7 $r30
+  * $r10 ($f64) $r10 $r18
+  * $r11 ($f64) $r11 $r19
+  * $r19 ($f64) $r10 $r19
+  * $r18 ($f64) $r11 $r18
+;
+l16_loop_b13:
+  ||
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r29 $r28
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r19 $r18
+  * $r22 ($f64) $r22 $r16
+  * $r23 ($f64) $r23 $r17
+  * $r17 ($f64) $r22 $r17
+  * $r16 ($f64) $r23 $r16
+;
+l16_loop_b14:
+  ||
+  - $r6 ($f64) $r6 $r7
+  + $r7 ($f64) $r31 $r30
+  * $r20 ($f64) $r20 $r24
+  * $r21 ($f64) $r21 $r25
+  + $r22 ($f64) $r22 $r23
+  - $r23 ($f64) $r17 $r16
+  $st ($u256) [$r2 + -64] $r12
+  $st ($u256) [$r2 + -96] $r8
+;
+l16_loop_b15:
+  ||
+  $ld ($u256) $r20 [$r0 + $r1 ++8]
+  $ld ($u256) $r4 [$r1 + 128]
+  $st ($u256) [$r2 + -128] $r4
+  $st ($u256) [$r2 + -32] $r20
+  ? ($i16) $r3 >--1 $goto l16_loop
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK l16_fin
+// radix-4 stage L=16 (constant twiddles): last iteration
+l16_fin:
+  ||
+  $ld ($u256) $r28 [$r1 + -192]
+  $ld ($u256) $r12 [$r1 + -64]
+  $ld ($u256) $r16 [$r1 + -224]
+  $ld ($u256) $r8 [$r1 + -96]
+  + $r20 ($f64) $r20 $r4
+  - $r4 ($f64) $r20 $r4
+  + $r23 ($f64) $r23 $r7
+  - $r7 ($f64) $r23 $r7
+;
+l16_fin_b1:
+  ||
+  + $r22 ($f64) $r22 $r6
+  - $r6 ($f64) $r22 $r6
+  + $r30 ($f64) $r30 $r14
+  - $r14 ($f64) $r30 $r14
+  + $r31 ($f64) $r31 $r15
+  - $r15 ($f64) $r31 $r15
+  + $r19 ($f64) $r19 $r11
+  - $r11 ($f64) $r19 $r11
+;
+l16_fin_b2:
+  ||
+  + $r28 ($f64) $r28 $r12
+  - $r12 ($f64) $r28 $r12
+  + $r18 ($f64) $r18 $r10
+  - $r10 ($f64) $r18 $r10
+  + $r22 ($f64) $r22 $r30
+  - $r30 ($f64) $r22 $r30
+  + $r23 ($f64) $r23 $r31
+  - $r31 ($f64) $r23 $r31
+;
+l16_fin_b3:
+  ||
+  + $r21 ($f64) $r21 $r5
+  - $r5 ($f64) $r21 $r5
+  + $r29 ($f64) $r29 $r13
+  - $r13 ($f64) $r29 $r13
+  + $r20 ($f64) $r20 $r28
+  - $r28 ($f64) $r20 $r28
+  + $r30 ($f64) $r30 $r31
+  - $r31 ($f64) $r31 $r30
+;
+l16_fin_b4:
+  ||
+  + $r21 ($f64) $r21 $r29
+  - $r29 ($f64) $r21 $r29
+  + $r6 ($f64) $r6 $r15
+  - $r7 ($f64) $r7 $r14
+  - $r14 ($f64) $r6 $r15
+  + $r15 ($f64) $r7 $r14
+  * $r30 ($f64) $r30 $r24
+  * $r31 ($f64) $r31 $r24
+;
+l16_fin_b5:
+  ||
+  $ld ($u256) $r28 [$r1 + -160]
+  $ld ($u256) $r20 [$r1 + -32]
+  + $r16 ($f64) $r16 $r8
+  - $r8 ($f64) $r16 $r8
+  + $r17 ($f64) $r17 $r9
+  - $r9 ($f64) $r17 $r9
+  $st ($u256) [$r0 + $r2 ++8] $r20
+  $st ($u256) [$r2 + 64] $r28
+;
+l16_fin_b6:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r30 ($f64) $r30 $r22
+  - $r22 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r23 ($f64) $r31 $r23
+;
+l16_fin_b7:
+  ||
+  + $r16 ($f64) $r16 $r28
+  + $r17 ($f64) $r17 $r29
+  - $r28 ($f64) $r17 $r29
+  - $r29 ($f64) $r28 $r16
+  + $r18 ($f64) $r18 $r30
+  - $r30 ($f64) $r18 $r30
+  + $r19 ($f64) $r19 $r31
+  - $r31 ($f64) $r19 $r31
+;
+l16_fin_b8:
+  ||
+  + $r8 ($f64) $r8 $r21
+  - $r9 ($f64) $r9 $r20
+  - $r20 ($f64) $r8 $r21
+  + $r21 ($f64) $r9 $r20
+  $ld ($u128) $r16 [$r26 + 16]                        //@ 16*S16
+  - $r30 ($f64) $r31 $r30
+  + $r31 ($f64) $r30 $r31
+  $st ($u256) [$r2 + -224] $r16
+;
+l16_fin_b9:
+  ||
+  + $r10 ($f64) $r10 $r23
+  - $r11 ($f64) $r11 $r22
+  - $r22 ($f64) $r23 $r10
+  + $r23 ($f64) $r11 $r22
+  - $r20 ($f64) $r21 $r20
+  + $r21 ($f64) $r20 $r21
+  * $r30 ($f64) $r30 $r24
+  * $r31 ($f64) $r31 $r25
+;
+l16_fin_b10:
+  ||
+  + $r4 ($f64) $r4 $r13
+  - $r5 ($f64) $r5 $r12
+  - $r12 ($f64) $r4 $r13
+  + $r13 ($f64) $r5 $r12
+  $ld ($u128) $r28 [$r26 + 48]                        //@ 48*S16
+  + $r8 ($f64) $r8 $r9
+  - $r9 ($f64) $r9 $r8
+  $st ($u256) [$r2 + -160] $r28
+;
+l16_fin_b11:
+  ||
+  $ld ($u128) $r30 [$r26 + 16]                        //@ 16*S16
+  $ld ($u128) $r18 [$r26 + 48]                        //@ 48*S16
+  * $r14 ($f64) $r14 $r28
+  * $r15 ($f64) $r15 $r29
+  * $r29 ($f64) $r14 $r29
+  * $r28 ($f64) $r15 $r28
+  * $r8 ($f64) $r8 $r24
+  * $r9 ($f64) $r9 $r24
+;
+l16_fin_b12:
+  ||
+  * $r6 ($f64) $r6 $r30
+  * $r7 ($f64) $r7 $r31
+  * $r31 ($f64) $r6 $r31
+  * $r30 ($f64) $r7 $r30
+  * $r10 ($f64) $r10 $r18
+  * $r11 ($f64) $r11 $r19
+  * $r19 ($f64) $r10 $r19
+  * $r18 ($f64) $r11 $r18
+;
+l16_fin_b13:
+  ||
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r29 $r28
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r19 $r18
+  * $r22 ($f64) $r22 $r16
+  * $r23 ($f64) $r23 $r17
+  * $r17 ($f64) $r22 $r17
+  * $r16 ($f64) $r23 $r16
+;
+l16_fin_b14:
+  ||
+  - $r6 ($f64) $r6 $r7
+  + $r7 ($f64) $r31 $r30
+  * $r20 ($f64) $r20 $r24
+  * $r21 ($f64) $r21 $r25
+  + $r22 ($f64) $r22 $r23
+  - $r23 ($f64) $r17 $r16
+  $st ($u256) [$r2 + -64] $r12
+  $st ($u256) [$r2 + -96] $r8
+;
+l16_fin_b15:
+  ||
+  $st ($u256) [$r2 + -128] $r4
+  $st ($u256) [$r2 + -32] $r20
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK r4_pro
+// final radix-4 stage L=4 (trivial twiddles): setup + prologue
+r4_pro:
+  ||
+  $set $r1 0 0                                        //@ 0
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+r4_pro_b1:
+  ||
+  $ld ($u256) $r28 [$r0 + $r1 ++8]
+  $ld ($u256) $r24 [$r1 + 32]
+  $ld ($u256) $r20 [$r1 + 64]
+  $ld ($u256) $r16 [$r1 + 96]
+  $set $r2 0 0                                        //@ 0
+  $set $r3 0 2                                        //@ R4_IT-2
+  $null
+  $null
+;
+//@END
+//@BLOCK r4_loop
+// final radix-4 stage L=4 (trivial twiddles): loop body
+//   (loop block: executes R4_IT-1 times; removed by the generator when that is 0)
+r4_loop:
+  ||
+  + $r28 ($f64) $r28 $r24
+  - $r24 ($f64) $r28 $r24
+  + $r29 ($f64) $r29 $r25
+  - $r25 ($f64) $r29 $r25
+  + $r30 ($f64) $r30 $r26
+  - $r26 ($f64) $r30 $r26
+  + $r31 ($f64) $r31 $r27
+  - $r27 ($f64) $r31 $r27
+;
+r4_loop_b1:
+  ||
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+  + $r24 ($f64) $r24 $r27
+  - $r25 ($f64) $r25 $r26
+  - $r26 ($f64) $r24 $r27
+  + $r27 ($f64) $r25 $r26
+;
+r4_loop_b2:
+  ||
+  + $r20 ($f64) $r20 $r16
+  - $r16 ($f64) $r20 $r16
+  + $r21 ($f64) $r21 $r17
+  - $r17 ($f64) $r21 $r17
+  + $r22 ($f64) $r22 $r18
+  - $r18 ($f64) $r22 $r18
+  + $r23 ($f64) $r23 $r19
+  - $r19 ($f64) $r23 $r19
+;
+r4_loop_b3:
+  ||
+  $st ($u256) [$r0 + $r2 ++8] $r28
+  $st ($u256) [$r2 + 32] $r24
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+  $ld ($u256) $r12 [$r1 + -128]
+  $ld ($u256) $r8 [$r1 + -96]
+;
+r4_loop_b4:
+  ||
+  + $r16 ($f64) $r16 $r19
+  - $r17 ($f64) $r17 $r18
+  - $r18 ($f64) $r16 $r19
+  + $r19 ($f64) $r17 $r18
+  $st ($u256) [$r2 + -192] $r20
+  + $r12 ($f64) $r12 $r8
+  - $r8 ($f64) $r12 $r8
+  $ld ($u256) $r4 [$r1 + -64]
+;
+r4_loop_b5:
+  ||
+  $st ($u256) [$r2 + -160] $r16
+  + $r13 ($f64) $r13 $r9
+  - $r9 ($f64) $r13 $r9
+  + $r14 ($f64) $r14 $r10
+  - $r10 ($f64) $r14 $r10
+  + $r15 ($f64) $r15 $r11
+  - $r11 ($f64) $r15 $r11
+  $ld ($u256) $r28 [$r1 + -32]
+;
+r4_loop_b6:
+  ||
+  + $r12 ($f64) $r12 $r14
+  - $r14 ($f64) $r12 $r14
+  + $r13 ($f64) $r13 $r15
+  - $r15 ($f64) $r13 $r15
+  + $r8 ($f64) $r8 $r11
+  - $r9 ($f64) $r9 $r10
+  - $r10 ($f64) $r8 $r11
+  + $r11 ($f64) $r9 $r10
+;
+r4_loop_b7:
+  ||
+  + $r4 ($f64) $r4 $r28
+  - $r28 ($f64) $r4 $r28
+  + $r5 ($f64) $r5 $r29
+  - $r29 ($f64) $r5 $r29
+  + $r6 ($f64) $r6 $r30
+  - $r30 ($f64) $r6 $r30
+  + $r7 ($f64) $r7 $r31
+  - $r31 ($f64) $r7 $r31
+;
+r4_loop_b8:
+  ||
+  + $r4 ($f64) $r4 $r6
+  - $r6 ($f64) $r4 $r6
+  + $r5 ($f64) $r5 $r7
+  - $r7 ($f64) $r5 $r7
+  + $r28 ($f64) $r28 $r31
+  - $r29 ($f64) $r29 $r30
+  - $r30 ($f64) $r28 $r31
+  + $r31 ($f64) $r29 $r30
+;
+r4_loop_b9:
+  ||
+  $st ($u256) [$r2 + -128] $r12
+  $st ($u256) [$r2 + -96] $r8
+  $st ($u256) [$r2 + -64] $r4
+  $st ($u256) [$r2 + -32] $r28
+  $null
+  $null
+  $null
+  $null
+;
+r4_loop_b10:
+  ||
+  $ld ($u256) $r28 [$r0 + $r1 ++8]
+  $ld ($u256) $r24 [$r1 + 32]
+  $ld ($u256) $r20 [$r1 + 64]
+  $ld ($u256) $r16 [$r1 + 96]
+  ? ($i16) $r3 >--1 $goto r4_loop
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK r4_fin
+// final radix-4 stage L=4 (trivial twiddles): last iteration
+r4_fin:
+  ||
+  + $r28 ($f64) $r28 $r24
+  - $r24 ($f64) $r28 $r24
+  + $r29 ($f64) $r29 $r25
+  - $r25 ($f64) $r29 $r25
+  + $r30 ($f64) $r30 $r26
+  - $r26 ($f64) $r30 $r26
+  + $r31 ($f64) $r31 $r27
+  - $r27 ($f64) $r31 $r27
+;
+r4_fin_b1:
+  ||
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+  + $r24 ($f64) $r24 $r27
+  - $r25 ($f64) $r25 $r26
+  - $r26 ($f64) $r24 $r27
+  + $r27 ($f64) $r25 $r26
+;
+r4_fin_b2:
+  ||
+  + $r20 ($f64) $r20 $r16
+  - $r16 ($f64) $r20 $r16
+  + $r21 ($f64) $r21 $r17
+  - $r17 ($f64) $r21 $r17
+  + $r22 ($f64) $r22 $r18
+  - $r18 ($f64) $r22 $r18
+  + $r23 ($f64) $r23 $r19
+  - $r19 ($f64) $r23 $r19
+;
+r4_fin_b3:
+  ||
+  $st ($u256) [$r0 + $r2 ++8] $r28
+  $st ($u256) [$r2 + 32] $r24
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+  $ld ($u256) $r12 [$r1 + -128]
+  $ld ($u256) $r8 [$r1 + -96]
+;
+r4_fin_b4:
+  ||
+  + $r16 ($f64) $r16 $r19
+  - $r17 ($f64) $r17 $r18
+  - $r18 ($f64) $r16 $r19
+  + $r19 ($f64) $r17 $r18
+  $st ($u256) [$r2 + -192] $r20
+  + $r12 ($f64) $r12 $r8
+  - $r8 ($f64) $r12 $r8
+  $ld ($u256) $r4 [$r1 + -64]
+;
+r4_fin_b5:
+  ||
+  $st ($u256) [$r2 + -160] $r16
+  + $r13 ($f64) $r13 $r9
+  - $r9 ($f64) $r13 $r9
+  + $r14 ($f64) $r14 $r10
+  - $r10 ($f64) $r14 $r10
+  + $r15 ($f64) $r15 $r11
+  - $r11 ($f64) $r15 $r11
+  $ld ($u256) $r28 [$r1 + -32]
+;
+r4_fin_b6:
+  ||
+  + $r12 ($f64) $r12 $r14
+  - $r14 ($f64) $r12 $r14
+  + $r13 ($f64) $r13 $r15
+  - $r15 ($f64) $r13 $r15
+  + $r8 ($f64) $r8 $r11
+  - $r9 ($f64) $r9 $r10
+  - $r10 ($f64) $r8 $r11
+  + $r11 ($f64) $r9 $r10
+;
+r4_fin_b7:
+  ||
+  + $r4 ($f64) $r4 $r28
+  - $r28 ($f64) $r4 $r28
+  + $r5 ($f64) $r5 $r29
+  - $r29 ($f64) $r5 $r29
+  + $r6 ($f64) $r6 $r30
+  - $r30 ($f64) $r6 $r30
+  + $r7 ($f64) $r7 $r31
+  - $r31 ($f64) $r7 $r31
+;
+r4_fin_b8:
+  ||
+  + $r4 ($f64) $r4 $r6
+  - $r6 ($f64) $r4 $r6
+  + $r5 ($f64) $r5 $r7
+  - $r7 ($f64) $r5 $r7
+  + $r28 ($f64) $r28 $r31
+  - $r29 ($f64) $r29 $r30
+  - $r30 ($f64) $r28 $r31
+  + $r31 ($f64) $r29 $r30
+;
+r4_fin_b9:
+  ||
+  $st ($u256) [$r2 + -128] $r12
+  $st ($u256) [$r2 + -96] $r8
+  $st ($u256) [$r2 + -64] $r4
+  $st ($u256) [$r2 + -32] $r28
+  $halt
+  $null
+  $null
+  $null
+;
+//@END
+
+//=============================================================================
+//  LIBRARY (unreachable for N=64): blocks used by other N.  The immediates
+//  shown are placeholders; the generator evaluates the //@ formulas.
+//=============================================================================
+//@BLOCK s0_TA
+// stage 0: last pair with 3k < N/2, then switch W3 pointer to the conj region
+s0_TA:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++6]
+  $ld ($u128) $r20 [$r28 + 48]
+;
+s0_TA_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+s0_TA_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+s0_TA_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  - $r16 ($f64) $r16 $r17
+  + $r17 ($f64) $r23 $r22
+  - $r18 ($f64) $r18 $r19
+  + $r19 ($f64) $r21 $r20
+  $set $r29 0 1                                       //@ S0_NB-1
+;
+s0_TA_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+s0_TA_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+s0_TA_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+s0_TA_b7:
+  ||
+  $st ($u128) [$r0 + $r31 ++1] $r20
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  $null
+;
+s0_TA_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  + $r28 ($i64) $r30 0
+  $null
+;
+s0_TA_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+s0_TA_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  $null
+  $null
+;
+//@END
+//@BLOCK neg_pro
+// twiddle table: T[N/8+m] = -T[m], m < N/16: setup + prologue
+neg_pro:
+  ||
+  $set $r1 0 1024                                     //@ T
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+neg_pro_b1:
+  ||
+  $ld ($u256) $r12 [$r0 + $r1 ++4]
+  $ld ($u256) $r8 [$r1 + 32]
+  $ld ($u256) $r4 [$r1 + 64]
+  $ld ($u256) $r28 [$r1 + 96]
+  $set $r2 0 1152                                     //@ T+2*N
+  $set $r3 0 -1                                       //@ NEG_IT-2
+  $null
+  $null
+;
+//@END
+//@BLOCK neg_loop
+// twiddle table: T[N/8+m] = -T[m], m < N/16: loop body
+//   (loop block: executes NEG_IT-1 times; removed by the generator when that is 0)
+neg_loop:
+  ||
+  - $r12 ($f64) $r0 $r12
+  - $r13 ($f64) $r0 $r13
+  - $r14 ($f64) $r0 $r14
+  - $r15 ($f64) $r0 $r15
+  - $r4 ($f64) $r0 $r4
+  - $r29 ($f64) $r0 $r29
+  - $r30 ($f64) $r0 $r30
+  - $r31 ($f64) $r0 $r31
+;
+neg_loop_b1:
+  ||
+  - $r8 ($f64) $r0 $r8
+  - $r9 ($f64) $r0 $r9
+  - $r10 ($f64) $r0 $r10
+  - $r11 ($f64) $r0 $r11
+  - $r5 ($f64) $r0 $r5
+  - $r6 ($f64) $r0 $r6
+  - $r7 ($f64) $r0 $r7
+  - $r28 ($f64) $r0 $r28
+;
+neg_loop_b2:
+  ||
+  $st ($u256) [$r0 + $r2 ++4] $r12
+  $st ($u256) [$r2 + 32] $r8
+  $st ($u256) [$r2 + 64] $r4
+  $st ($u256) [$r2 + 96] $r28
+  $null
+  $null
+  $null
+  $null
+;
+neg_loop_b3:
+  ||
+  $ld ($u256) $r12 [$r0 + $r1 ++4]
+  $ld ($u256) $r8 [$r1 + 32]
+  $ld ($u256) $r4 [$r1 + 64]
+  $ld ($u256) $r28 [$r1 + 96]
+  ? ($i16) $r3 >--1 $goto neg_loop
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK neg_fin
+// twiddle table: T[N/8+m] = -T[m], m < N/16: last iteration
+neg_fin:
+  ||
+  - $r12 ($f64) $r0 $r12
+  - $r13 ($f64) $r0 $r13
+  - $r14 ($f64) $r0 $r14
+  - $r15 ($f64) $r0 $r15
+  - $r4 ($f64) $r0 $r4
+  - $r29 ($f64) $r0 $r29
+  - $r30 ($f64) $r0 $r30
+  - $r31 ($f64) $r0 $r31
+;
+neg_fin_b1:
+  ||
+  - $r8 ($f64) $r0 $r8
+  - $r9 ($f64) $r0 $r9
+  - $r10 ($f64) $r0 $r10
+  - $r11 ($f64) $r0 $r11
+  - $r5 ($f64) $r0 $r5
+  - $r6 ($f64) $r0 $r6
+  - $r7 ($f64) $r0 $r7
+  - $r28 ($f64) $r0 $r28
+;
+neg_fin_b2:
+  ||
+  $st ($u256) [$r0 + $r2 ++4] $r12
+  $st ($u256) [$r2 + 32] $r8
+  $st ($u256) [$r2 + 64] $r4
+  $st ($u256) [$r2 + 96] $r28
+  $null
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK cmp_pro
+// twiddle table compaction: T[m] = T[4m], m < 3L/4: setup + prologue
+cmp_pro:
+  ||
+  $set $r1 0 1024                                     //@ T
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+cmp_pro_b1:
+  ||
+  $ld ($u256) $r24 [$r0 + $r1 ++8]
+  $set $r2 0 1024                                     //@ T
+  $set $r3 0 1                                        //@ CMP_IT-2
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK cmp_loop
+// twiddle table compaction: T[m] = T[4m], m < 3L/4: loop body
+//   (loop block: executes CMP_IT-1 times; removed by the generator when that is 0)
+cmp_loop:
+  ||
+  $ld ($u128) $r26 [$r1 + -192]
+  $ld ($u128) $r28 [$r1 + -128]
+  $ld ($u128) $r30 [$r1 + -64]
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+cmp_loop_b1:
+  ||
+  $ld ($u256) $r24 [$r0 + $r1 ++8]
+  $st ($u256) [$r0 + $r2 ++2] $r24
+  $st ($u256) [$r2 + 32] $r28
+  ? ($i16) $r3 >--1 $goto cmp_loop
+  $null
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK cmp_fin
+// twiddle table compaction: T[m] = T[4m], m < 3L/4: last iteration
+cmp_fin:
+  ||
+  $ld ($u128) $r26 [$r1 + -192]
+  $ld ($u128) $r28 [$r1 + -128]
+  $ld ($u128) $r30 [$r1 + -64]
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+cmp_fin_b1:
+  ||
+  $st ($u256) [$r0 + $r2 ++2] $r24
+  $st ($u256) [$r2 + 32] $r28
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK gen_pro
+// radix-4 stage L (G=N/L groups, Q=L/4): setup + prologue
+gen_pro:
+  ||
+  $set $r1 0 0                                        //@ 0
+  $set $r24 0 512                                     //@ 32*Q
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+gen_pro_b1:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  $set $r3 0 256                                      //@ 16*Q
+  $set $r25 0 768                                     //@ 48*Q
+  $set $r29 0 6                                       //@ Q//2-2
+  $set $r30 0 0                                       //@ G-1
+  $null
+  $null
+;
+gen_pro_b2:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $set $r27 0 1024                                    //@ T
+  $set $r28 0 1024                                    //@ T
+;
+gen_pro_b3:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  $set $r2 0 0                                        //@ 0
+  $set $r26 0 1024                                    //@ T
+;
+//@END
+//@BLOCK gen_in
+// inner loop: pairs 0..Q/2-2 of a group
+gen_in:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++6]
+  $ld ($u128) $r20 [$r28 + 48]
+;
+gen_in_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+gen_in_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+gen_in_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  - $r16 ($f64) $r16 $r17
+  + $r17 ($f64) $r23 $r22
+  - $r18 ($f64) $r18 $r19
+  + $r19 ($f64) $r21 $r20
+  $null
+;
+gen_in_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+gen_in_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+gen_in_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+gen_in_b7:
+  ||
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  $null
+  $null
+;
+gen_in_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  $null
+  $null
+;
+gen_in_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+gen_in_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  ? ($i16) $r29 >--1 $goto gen_in
+  $null
+;
+//@END
+//@BLOCK gen_tr
+// last pair of a group + jump to next group (pointer/twiddle reset)
+gen_tr:
+  ||
+  + $r8 ($f64) $r8 $r16
+  - $r16 ($f64) $r8 $r16
+  + $r9 ($f64) $r9 $r17
+  - $r17 ($f64) $r9 $r17
+  + $r11 ($f64) $r11 $r19
+  - $r19 ($f64) $r11 $r19
+  $ld ($u128) $r22 [$r0 + $r28 ++6]
+  $ld ($u128) $r20 [$r28 + 48]
+;
+gen_tr_b1:
+  ||
+  + $r12 ($f64) $r12 $r17
+  - $r13 ($f64) $r13 $r16
+  - $r16 ($f64) $r12 $r17
+  + $r17 ($f64) $r13 $r16
+  + $r14 ($f64) $r14 $r19
+  - $r15 ($f64) $r15 $r18
+  - $r18 ($f64) $r14 $r19
+  + $r19 ($f64) $r15 $r18
+;
+gen_tr_b2:
+  ||
+  * $r16 ($f64) $r16 $r22
+  * $r17 ($f64) $r17 $r23
+  * $r23 ($f64) $r16 $r23
+  * $r22 ($f64) $r17 $r22
+  * $r18 ($f64) $r18 $r20
+  * $r19 ($f64) $r19 $r21
+  * $r21 ($f64) $r18 $r21
+  * $r20 ($f64) $r19 $r20
+;
+gen_tr_b3:
+  ||
+  + $r6 ($f64) $r6 $r10
+  - $r10 ($f64) $r6 $r10
+  $ld ($u256) $r20 [$r0 + $r26 ++1]
+  - $r16 ($f64) $r16 $r17
+  + $r17 ($f64) $r23 $r22
+  - $r18 ($f64) $r18 $r19
+  + $r19 ($f64) $r21 $r20
+  $set $r29 0 6                                       //@ Q//2-2
+;
+gen_tr_b4:
+  ||
+  * $r12 ($f64) $r12 $r20
+  * $r13 ($f64) $r13 $r21
+  * $r21 ($f64) $r12 $r21
+  * $r20 ($f64) $r13 $r20
+  * $r14 ($f64) $r14 $r22
+  * $r15 ($f64) $r15 $r23
+  * $r23 ($f64) $r14 $r23
+  * $r22 ($f64) $r15 $r22
+;
+gen_tr_b5:
+  ||
+  + $r7 ($f64) $r7 $r11
+  - $r11 ($f64) $r7 $r11
+  $ld ($u128) $r20 [$r0 + $r27 ++4]
+  $ld ($u128) $r22 [$r27 + 32]
+  - $r12 ($f64) $r12 $r13
+  + $r13 ($f64) $r21 $r20
+  - $r14 ($f64) $r14 $r15
+  + $r15 ($f64) $r23 $r22
+;
+gen_tr_b6:
+  ||
+  + $r4 ($f64) $r4 $r8
+  - $r8 ($f64) $r4 $r8
+  + $r5 ($f64) $r5 $r9
+  - $r9 ($f64) $r5 $r9
+  * $r10 ($f64) $r10 $r22
+  * $r11 ($f64) $r11 $r23
+  * $r23 ($f64) $r10 $r23
+  * $r22 ($f64) $r11 $r22
+;
+gen_tr_b7:
+  ||
+  * $r8 ($f64) $r8 $r20
+  * $r9 ($f64) $r9 $r21
+  * $r21 ($f64) $r8 $r21
+  * $r20 ($f64) $r9 $r20
+  - $r10 ($f64) $r10 $r11
+  + $r11 ($f64) $r23 $r22
+  + $r1 ($i64) $r1 $r25
+  $set $r27 0 1024                                    //@ T
+;
+gen_tr_b8:
+  ||
+  $ld ($u256) $r4 [$r0 + $r1 ++0]
+  $ld ($u256) $r12 [$r24 + $r1 ++0]
+  - $r8 ($f64) $r8 $r9
+  + $r9 ($f64) $r21 $r20
+  $st ($u256) [$r0 + $r2 ++0] $r4
+  $st ($u256) [$r24 + $r2 ++0] $r12
+  $set $r26 0 1024                                    //@ T
+  $set $r28 0 1024                                    //@ T
+;
+gen_tr_b9:
+  ||
+  $ld ($u256) $r8 [$r3 + $r1 ++0]
+  $ld ($u256) $r16 [$r25 + $r1 ++1]
+  + $r5 ($f64) $r5 $r13
+  - $r13 ($f64) $r5 $r13
+  + $r7 ($f64) $r7 $r15
+  - $r15 ($f64) $r7 $r15
+  $st ($u256) [$r3 + $r2 ++0] $r8
+  $st ($u256) [$r25 + $r2 ++1] $r16
+;
+gen_tr_b10:
+  ||
+  + $r4 ($f64) $r4 $r12
+  - $r12 ($f64) $r4 $r12
+  + $r6 ($f64) $r6 $r14
+  - $r14 ($f64) $r6 $r14
+  + $r10 ($f64) $r10 $r18
+  - $r18 ($f64) $r10 $r18
+  + $r2 ($i64) $r2 $r25
+  ? ($i16) $r30 >--1 $goto gen_in
+;
+//@END
+//@BLOCK l8_pro
+// radix-4 stage L=8 fused with the final radix-2 stage: setup + prologue
+l8_pro:
+  ||
+  $set $r1 0 0                                        //@ 0
+  $set $r26 0 1024                                    //@ T
+  $null
+  $null
+  $null
+  $null
+  $null
+  $null
+;
+l8_pro_b1:
+  ||
+  $ld ($u256) $r28 [$r0 + $r1 ++8]
+  $ld ($u256) $r4 [$r1 + 64]
+  $ld ($u256) $r16 [$r1 + 128]
+  $ld ($u256) $r12 [$r1 + 192]
+  $set $r2 0 0                                        //@ 0
+  $set $r3 0 2                                        //@ L8_IT-2
+  $ld ($u128) $r24 [$r26 + 16]                        //@ 16*S8
+  $null
+;
+//@END
+//@BLOCK l8_loop
+// radix-4 stage L=8 fused with the final radix-2 stage: loop body
+//   (loop block: executes L8_IT-1 times; removed by the generator when that is 0)
+l8_loop:
+  ||
+  $ld ($u256) $r20 [$r1 + -224]
+  $ld ($u256) $r8 [$r1 + -160]
+  + $r28 ($f64) $r28 $r4
+  - $r4 ($f64) $r28 $r4
+  + $r17 ($f64) $r17 $r13
+  - $r13 ($f64) $r17 $r13
+  + $r18 ($f64) $r18 $r14
+  - $r14 ($f64) $r18 $r14
+;
+l8_loop_b1:
+  ||
+  + $r29 ($f64) $r29 $r5
+  - $r5 ($f64) $r29 $r5
+  + $r21 ($f64) $r21 $r9
+  - $r9 ($f64) $r21 $r9
+  + $r31 ($f64) $r31 $r7
+  - $r7 ($f64) $r31 $r7
+  + $r19 ($f64) $r19 $r15
+  - $r15 ($f64) $r19 $r15
+;
+l8_loop_b2:
+  ||
+  + $r20 ($f64) $r20 $r8
+  - $r8 ($f64) $r20 $r8
+  + $r30 ($f64) $r30 $r6
+  - $r6 ($f64) $r30 $r6
+  + $r22 ($f64) $r22 $r10
+  - $r10 ($f64) $r22 $r10
+  + $r23 ($f64) $r23 $r11
+  - $r11 ($f64) $r23 $r11
+;
+l8_loop_b3:
+  ||
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r6 ($f64) $r6 $r11
+  - $r7 ($f64) $r7 $r10
+  - $r10 ($f64) $r6 $r11
+  + $r11 ($f64) $r7 $r10
+  + $r16 ($f64) $r16 $r12
+  - $r12 ($f64) $r16 $r12
+;
+l8_loop_b4:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r30 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r22 ($f64) $r31 $r23
+  - $r23 ($f64) $r22 $r30
+  - $r10 ($f64) $r11 $r10
+  + $r11 ($f64) $r10 $r11
+;
+l8_loop_b5:
+  ||
+  + $r4 ($f64) $r4 $r9
+  - $r5 ($f64) $r5 $r8
+  - $r8 ($f64) $r4 $r9
+  + $r9 ($f64) $r5 $r8
+  + $r6 ($f64) $r6 $r7
+  - $r7 ($f64) $r7 $r6
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+;
+l8_loop_b6:
+  ||
+  * $r10 ($f64) $r10 $r24
+  * $r11 ($f64) $r11 $r25
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+;
+l8_loop_b7:
+  ||
+  * $r6 ($f64) $r6 $r24
+  * $r7 ($f64) $r7 $r24
+  + $r8 ($f64) $r8 $r10
+  - $r10 ($f64) $r8 $r10
+  $st ($u256) [$r0 + $r2 ++8] $r28
+  $st ($u256) [$r2 + 32] $r20
+  $ld ($u256) $r28 [$r1 + -96]
+  $ld ($u256) $r20 [$r1 + -32]
+;
+l8_loop_b8:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r30 ($f64) $r30 $r22
+  - $r22 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r23 ($f64) $r31 $r23
+;
+l8_loop_b9:
+  ||
+  + $r12 ($f64) $r12 $r21
+  - $r13 ($f64) $r13 $r20
+  - $r20 ($f64) $r12 $r21
+  + $r21 ($f64) $r13 $r20
+  + $r14 ($f64) $r14 $r23
+  - $r15 ($f64) $r15 $r22
+  - $r22 ($f64) $r14 $r23
+  + $r23 ($f64) $r15 $r22
+;
+l8_loop_b10:
+  ||
+  + $r16 ($f64) $r16 $r28
+  - $r28 ($f64) $r16 $r28
+  + $r18 ($f64) $r18 $r30
+  + $r19 ($f64) $r19 $r31
+  - $r30 ($f64) $r19 $r31
+  - $r31 ($f64) $r30 $r18
+  + $r14 ($f64) $r14 $r15
+  - $r15 ($f64) $r15 $r14
+;
+l8_loop_b11:
+  ||
+  + $r4 ($f64) $r4 $r6
+  - $r6 ($f64) $r4 $r6
+  + $r17 ($f64) $r17 $r29
+  - $r29 ($f64) $r17 $r29
+  * $r14 ($f64) $r14 $r24
+  * $r15 ($f64) $r15 $r24
+  + $r16 ($f64) $r16 $r18
+  - $r18 ($f64) $r16 $r18
+;
+l8_loop_b12:
+  ||
+  + $r5 ($f64) $r5 $r7
+  - $r7 ($f64) $r5 $r7
+  + $r9 ($f64) $r9 $r11
+  - $r11 ($f64) $r9 $r11
+  - $r22 ($f64) $r23 $r22
+  + $r23 ($f64) $r22 $r23
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+;
+l8_loop_b13:
+  ||
+  $st ($u256) [$r2 + -192] $r4
+  $st ($u256) [$r2 + -160] $r8
+  * $r22 ($f64) $r22 $r24
+  * $r23 ($f64) $r23 $r25
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+  + $r12 ($f64) $r12 $r14
+  - $r14 ($f64) $r12 $r14
+;
+l8_loop_b14:
+  ||
+  + $r17 ($f64) $r17 $r19
+  - $r19 ($f64) $r17 $r19
+  + $r13 ($f64) $r13 $r15
+  - $r15 ($f64) $r13 $r15
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+;
+l8_loop_b15:
+  ||
+  $st ($u256) [$r2 + -128] $r16
+  $st ($u256) [$r2 + -96] $r28
+  $st ($u256) [$r2 + -64] $r12
+  $st ($u256) [$r2 + -32] $r20
+  $null
+  $null
+  $null
+  $null
+;
+l8_loop_b16:
+  ||
+  $ld ($u256) $r28 [$r0 + $r1 ++8]
+  $ld ($u256) $r4 [$r1 + 64]
+  $ld ($u256) $r16 [$r1 + 128]
+  $ld ($u256) $r12 [$r1 + 192]
+  ? ($i16) $r3 >--1 $goto l8_loop
+  $null
+  $null
+  $null
+;
+//@END
+//@BLOCK l8_fin
+// radix-4 stage L=8 fused with the final radix-2 stage: last iteration
+l8_fin:
+  ||
+  $ld ($u256) $r20 [$r1 + -224]
+  $ld ($u256) $r8 [$r1 + -160]
+  + $r28 ($f64) $r28 $r4
+  - $r4 ($f64) $r28 $r4
+  + $r17 ($f64) $r17 $r13
+  - $r13 ($f64) $r17 $r13
+  + $r18 ($f64) $r18 $r14
+  - $r14 ($f64) $r18 $r14
+;
+l8_fin_b1:
+  ||
+  + $r29 ($f64) $r29 $r5
+  - $r5 ($f64) $r29 $r5
+  + $r21 ($f64) $r21 $r9
+  - $r9 ($f64) $r21 $r9
+  + $r31 ($f64) $r31 $r7
+  - $r7 ($f64) $r31 $r7
+  + $r19 ($f64) $r19 $r15
+  - $r15 ($f64) $r19 $r15
+;
+l8_fin_b2:
+  ||
+  + $r20 ($f64) $r20 $r8
+  - $r8 ($f64) $r20 $r8
+  + $r30 ($f64) $r30 $r6
+  - $r6 ($f64) $r30 $r6
+  + $r22 ($f64) $r22 $r10
+  - $r10 ($f64) $r22 $r10
+  + $r23 ($f64) $r23 $r11
+  - $r11 ($f64) $r23 $r11
+;
+l8_fin_b3:
+  ||
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r6 ($f64) $r6 $r11
+  - $r7 ($f64) $r7 $r10
+  - $r10 ($f64) $r6 $r11
+  + $r11 ($f64) $r7 $r10
+  + $r16 ($f64) $r16 $r12
+  - $r12 ($f64) $r16 $r12
+;
+l8_fin_b4:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r30 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r22 ($f64) $r31 $r23
+  - $r23 ($f64) $r22 $r30
+  - $r10 ($f64) $r11 $r10
+  + $r11 ($f64) $r10 $r11
+;
+l8_fin_b5:
+  ||
+  + $r4 ($f64) $r4 $r9
+  - $r5 ($f64) $r5 $r8
+  - $r8 ($f64) $r4 $r9
+  + $r9 ($f64) $r5 $r8
+  + $r6 ($f64) $r6 $r7
+  - $r7 ($f64) $r7 $r6
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+;
+l8_fin_b6:
+  ||
+  * $r10 ($f64) $r10 $r24
+  * $r11 ($f64) $r11 $r25
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+;
+l8_fin_b7:
+  ||
+  * $r6 ($f64) $r6 $r24
+  * $r7 ($f64) $r7 $r24
+  + $r8 ($f64) $r8 $r10
+  - $r10 ($f64) $r8 $r10
+  $st ($u256) [$r0 + $r2 ++8] $r28
+  $st ($u256) [$r2 + 32] $r20
+  $ld ($u256) $r28 [$r1 + -96]
+  $ld ($u256) $r20 [$r1 + -32]
+;
+l8_fin_b8:
+  ||
+  + $r28 ($f64) $r28 $r20
+  - $r20 ($f64) $r28 $r20
+  + $r29 ($f64) $r29 $r21
+  - $r21 ($f64) $r29 $r21
+  + $r30 ($f64) $r30 $r22
+  - $r22 ($f64) $r30 $r22
+  + $r31 ($f64) $r31 $r23
+  - $r23 ($f64) $r31 $r23
+;
+l8_fin_b9:
+  ||
+  + $r12 ($f64) $r12 $r21
+  - $r13 ($f64) $r13 $r20
+  - $r20 ($f64) $r12 $r21
+  + $r21 ($f64) $r13 $r20
+  + $r14 ($f64) $r14 $r23
+  - $r15 ($f64) $r15 $r22
+  - $r22 ($f64) $r14 $r23
+  + $r23 ($f64) $r15 $r22
+;
+l8_fin_b10:
+  ||
+  + $r16 ($f64) $r16 $r28
+  - $r28 ($f64) $r16 $r28
+  + $r18 ($f64) $r18 $r30
+  + $r19 ($f64) $r19 $r31
+  - $r30 ($f64) $r19 $r31
+  - $r31 ($f64) $r30 $r18
+  + $r14 ($f64) $r14 $r15
+  - $r15 ($f64) $r15 $r14
+;
+l8_fin_b11:
+  ||
+  + $r4 ($f64) $r4 $r6
+  - $r6 ($f64) $r4 $r6
+  + $r17 ($f64) $r17 $r29
+  - $r29 ($f64) $r17 $r29
+  * $r14 ($f64) $r14 $r24
+  * $r15 ($f64) $r15 $r24
+  + $r16 ($f64) $r16 $r18
+  - $r18 ($f64) $r16 $r18
+;
+l8_fin_b12:
+  ||
+  + $r5 ($f64) $r5 $r7
+  - $r7 ($f64) $r5 $r7
+  + $r9 ($f64) $r9 $r11
+  - $r11 ($f64) $r9 $r11
+  - $r22 ($f64) $r23 $r22
+  + $r23 ($f64) $r22 $r23
+  + $r28 ($f64) $r28 $r30
+  - $r30 ($f64) $r28 $r30
+;
+l8_fin_b13:
+  ||
+  $st ($u256) [$r2 + -192] $r4
+  $st ($u256) [$r2 + -160] $r8
+  * $r22 ($f64) $r22 $r24
+  * $r23 ($f64) $r23 $r25
+  + $r29 ($f64) $r29 $r31
+  - $r31 ($f64) $r29 $r31
+  + $r12 ($f64) $r12 $r14
+  - $r14 ($f64) $r12 $r14
+;
+l8_fin_b14:
+  ||
+  + $r17 ($f64) $r17 $r19
+  - $r19 ($f64) $r17 $r19
+  + $r13 ($f64) $r13 $r15
+  - $r15 ($f64) $r13 $r15
+  + $r20 ($f64) $r20 $r22
+  - $r22 ($f64) $r20 $r22
+  + $r21 ($f64) $r21 $r23
+  - $r23 ($f64) $r21 $r23
+;
+l8_fin_b15:
+  ||
+  $st ($u256) [$r2 + -128] $r16
+  $st ($u256) [$r2 + -96] $r28
+  $st ($u256) [$r2 + -64] $r12
+  $st ($u256) [$r2 + -32] $r20
+  $halt
+  $null
+  $null
+  $null
+;
+//@END
